@@ -1,8 +1,9 @@
 const { onDocumentCreated, onDocumentDeleted } = require('firebase-functions/v2/firestore');
-const { onRequest } = require('firebase-functions/v2/https');
+const { onRequest, onCall } = require('firebase-functions/v2/https');
 const { google } = require('googleapis');
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const moment = require('moment-timezone');
+const fetch = require('node-fetch'); // Or use Axios if preferred
 const admin = require("firebase-admin");
 const { logger } = require("firebase-functions");
 
@@ -134,34 +135,6 @@ function processEvent(event) {
   };
 }
 
-function createAppointmentDoc(processedEvent, appointmentId) {
-  const { startMoment, endMoment, durationInMinutes, eventData } = processedEvent;
-  
-  return {
-    google_calendar_event_id: eventData.id,
-    title: eventData.summary,
-    notes: eventData.description,
-    start_time: startMoment.format("YYYY-MM-DD HH:mm:ss.SSS"),
-    end_time: endMoment.format("YYYY-MM-DD HH:mm:ss.SSS"),
-    appointment_time: toTimestampRome(startMoment),
-    date_timestamp: toTimestampRome(startMoment.clone().startOf("day")),
-    date: startMoment.format("YYYY-MM-DD HH:mm:ss.SSS"),
-    time: startMoment.format("HH:mm"),
-    total_duration: durationInMinutes,
-    color_id: "WHGQm6aJH4wdT8RIqbT1",
-    client_id: "",
-    email: "",
-    employee_id_list: [],
-    is_regular: true,
-    from_calendar_appointment: false,
-    number: "",
-    room_id_list: [],
-    status_id: "",
-    treatment_id_list: [],
-    created_at: admin.firestore.FieldValue.serverTimestamp(),
-  };
-}
-
 // Batch calendar updates for performance
 async function updateCalendarEventsBatch(calendar, updates) {
   const promises = updates.map(({ eventId, appointmentId, originalEvent }) =>
@@ -231,8 +204,6 @@ async function resolveClientName(clientId) {
   return "Cliente";
 }
 
-// ========== HTTP ENDPOINTS ==========
-
 exports.handleNotificationAction = onRequest(async (req, res) => {
   // CORS handling
   if (req.method === "OPTIONS") {
@@ -271,11 +242,12 @@ exports.handleNotificationAction = onRequest(async (req, res) => {
 
       const appt = snap.data() || {};
       const previousAction = appt.followup_action ?? null;
+      const clientId = appt.client_id;
 
       // Idempotent check
       if (previousAction === action) {
         resultPayload = {
-          status: "success",
+          notification_status: "success",
           message: `Appointment already marked as ${NOTIFICATION_ACTIONS[previousAction].label}`,
           appointmentId,
           action,
@@ -298,10 +270,45 @@ exports.handleNotificationAction = onRequest(async (req, res) => {
         followup_action_at: now,
       });
 
-      // Create audit records in batch
+      // 🔁 Maintain no_show flag counter
+      if (clientId) {
+        const flagRef = db.collection("clients").doc(clientId).collection("flags").doc("no_show");
+        const clientRef = db.collection("clients").doc(clientId);
+
+        // If setting to no-show, increment count and lock if needed
+        if (action === "appointment_no_show") {
+          const flagSnap = await tx.get(flagRef);
+          const currentCount = flagSnap.exists ? (flagSnap.data().count || 0) : 0;
+          const newCount = currentCount + 1;
+
+          tx.set(flagRef, {
+            count: newCount,
+            updated_at: now,
+          }, { merge: true });
+
+          // Lock client if no-show count reaches 2
+          if (newCount === 2) {
+            tx.update(clientRef, {
+              is_locked: true,
+            });
+          }
+        }
+
+        // If reversing a previous no-show, just decrement count
+        if (previousAction === "appointment_no_show" && action !== "appointment_no_show") {
+          tx.set(flagRef, {
+            count: admin.firestore.FieldValue.increment(-1),
+            updated_at: now,
+          }, { merge: true });
+
+          // ❌ NO auto-unlocking here
+        }
+      }
+
+      // Create audit records
       const actionsCol = appointmentRef.collection("actions");
       const auditRef = db.collection("appointment_actions").doc();
-      
+
       const actionData = {
         appointmentId,
         action,
@@ -316,7 +323,7 @@ exports.handleNotificationAction = onRequest(async (req, res) => {
       tx.set(auditRef, actionData);
 
       resultPayload = {
-        status: "success",
+        notification_status: "success",
         message: `Appointment marked as ${nextAction.label}`,
         appointmentId,
         action,
@@ -340,6 +347,142 @@ exports.handleNotificationAction = onRequest(async (req, res) => {
     return res.status(500).json({ error: "Internal server error", details: error.message });
   }
 });
+
+exports.unlockClient = onCall(async (request) => {
+  const { clientId } = request.data || {};
+  const callerUid = request.auth?.uid;
+
+  if (!callerUid) {
+    throw new functions.https.HttpsError("unauthenticated", "Authentication required.");
+  }
+
+  if (!clientId) {
+    throw new functions.https.HttpsError("invalid-argument", "Missing clientId.");
+  }
+
+  const db = admin.firestore();
+  const clientRef = db.collection("clients").doc(clientId);
+  const flagRef = clientRef.collection("flags").doc("no_show");
+
+  try {
+    // (Optional) Check if caller is admin
+    const callerDoc = await db.collection("clients").doc(callerUid).get();
+    const isAdmin = callerDoc.exists && callerDoc.data().isAdmin === true;
+
+    if (!isAdmin) {
+      throw new functions.https.HttpsError("permission-denied", "Only admins can unlock clients.");
+    }
+
+    const now = getTimestampNowRome();
+
+    await db.runTransaction(async (tx) => {
+      tx.update(clientRef, { is_locked: false });
+      tx.set(flagRef, {
+        count: 1,
+        updated_at: now
+      }, { merge: true });
+    });
+
+    return { status: "success", message: `Client ${clientId} unlocked and no-show count set to 1.` };
+
+  } catch (error) {
+    console.error("unlockClient error:", error);
+    throw new functions.https.HttpsError("internal", error.message);
+  }
+});
+
+exports.ignoreNotification = onCall(async (request) => {
+  const { clientId, notificationId } = request.data || {};
+  const callerUid = request.auth?.uid;
+
+  if (!callerUid) {
+    throw new functions.https.HttpsError("unauthenticated", "Authentication required.");
+  }
+
+  if (!clientId || !notificationId) {
+    throw new functions.https.HttpsError("invalid-argument", "Missing clientId or notificationId.");
+  }
+
+  const notifRef = admin.firestore().collection("new_notification").doc(notificationId);
+
+  try {
+    await admin.firestore().runTransaction(async (tx) => {
+      const snap = await tx.get(notifRef);
+      if (!snap.exists) {
+        throw new functions.https.HttpsError("not-found", "Notification not found.");
+      }
+
+      const data = snap.data();
+      const currentStatus = Array.isArray(data.status) ? data.status : [];
+
+      // If clientId is not even in the list, do nothing
+      if (!currentStatus.includes(clientId)) {
+        return;
+      }
+
+      // If clientId is the ONLY entry in status → delete entire doc
+      if (currentStatus.length === 1 && currentStatus[0] === clientId) {
+        tx.delete(notifRef);
+        return;
+      }
+
+      // Else, remove clientId from the array
+      const updatedStatus = currentStatus.filter(uid => uid !== clientId);
+      tx.update(notifRef, { status: updatedStatus });
+    });
+
+    return { status: "success", message: "Notification ignored" };
+
+  } catch (error) {
+    console.error("ignoreNotification error:", error);
+    throw new functions.https.HttpsError("internal", error.message);
+  }
+});
+
+exports.ignoreNotification = onRequest(async (req, res) => {
+  // CORS headers (optional, adjust as needed)
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).send('');
+  }
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
+
+  const { user_id, notification_id } = req.body;
+
+  if (!user_id || !notification_id) {
+    return res.status(400).json({ error: "Missing user_id or notification_id" });
+  }
+
+  try {
+    const notificationRef = db.collection("new_notification").doc(notification_id);
+    const notificationSnap = await notificationRef.get();
+
+    if (!notificationSnap.exists) {
+      return res.status(404).json({ error: "Notification not found" });
+    }
+
+    // Remove the user from the status array
+    await notificationRef.update({
+      status: admin.firestore.FieldValue.arrayRemove(user_id),
+    });
+
+    return res.status(200).json({ 
+      success: true, 
+      message: `User ${user_id} ignored notification ${notification_id}` 
+    });
+
+  } catch (error) {
+    console.error("Error ignoring notification:", error);
+    return res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
 
 // Consolidated user management
 exports.manageUsers = onRequest(async (req, res) => {
@@ -367,6 +510,279 @@ exports.manageUsers = onRequest(async (req, res) => {
   } catch (error) {
     logger.error(`User management error for action ${action}:`, error);
     return res.status(500).json({ error: error.message });
+  }
+});
+
+exports.createSingleAppointment = onCall(async (request) => {
+  try {
+    const {
+      start,
+      originalStart,
+      originalEnd,
+      number,
+      email,
+      clientId,
+      serviceIds,
+      duration,
+      clientFirstName,
+      clientLastName,
+      employeeIds,
+      notes,
+      statusId,
+      colorId,
+      isAdmin,
+      currentUserName,
+      currentUserId,
+      senderImage = '',
+    } = request.data;
+
+    const startDate = new Date(start);
+    const originalStartDate = new Date(originalStart);
+    const originalEndDate = new Date(originalEnd);
+    const durationMs = originalEndDate.getTime() - originalStartDate.getTime();
+    const endDate = new Date(startDate.getTime() + durationMs);
+
+    const timestamp = admin.firestore.Timestamp.fromDate(startDate);
+    const time = startDate.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+
+    const appointment = {
+      number,
+      email,
+      client_id: clientId,
+      date_timestamp: timestamp,
+      date: startDate.toISOString(),
+      start_time: startDate.toISOString(),
+      end_time: endDate.toISOString(),
+      service_id_list: serviceIds,
+      is_regular: true,
+      total_duration: duration,
+      employee_id_list: employeeIds,
+      room_id_list: [],
+      notes: notes || '',
+      time,
+      status_id: statusId,
+      from_calendar_appointment: false,
+      color_id: colorId,
+      appointment_time: timestamp,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    const docRef = await db.collection('appointments').add(appointment);
+    const data = (await docRef.get()).data();
+
+    // ===== Google Calendar Sync =====
+    try {
+      const response = await fetch('https://us-central1-aetherium-salon.cloudfunctions.net/googleCalendarEvent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          operation: 'CREATE',
+          appointment_id: docRef.id,
+          appointment: {
+            ...data,
+            date_timestamp: {
+              time: data.date_timestamp.toDate().toISOString(),
+            },
+          },
+        }),
+      });
+
+      if (response.status !== 200) {
+        throw new Error(await response.text());
+      }
+    } catch (calendarErr) {
+      console.error('❌ Calendar Sync Failed:', calendarErr);
+    }
+
+    // ===== Notification =====
+    await db.collection('new_notification').add({
+      id: '',
+      title: isAdmin
+        ? 'Abbiamo creato un nuovo appuntamento'
+        : `${currentUserName} ha aggiunto un nuovo appuntamento`,
+      body: isAdmin
+        ? 'Verifica i dettagli nella tua area personale'
+        : 'Nuovo appuntamento aggiunto al calendario',
+      senderId: currentUserId,
+      receiverId: isAdmin ? [clientId] : ['admin'],
+      senderImage,
+      senderName: currentUserName,
+      createdAt: admin.firestore.Timestamp.now(),
+      type: 'appointment',
+      desc: 'Nuovo appuntamento',
+      status: [],
+      appointmentId: docRef.id,
+      clientId,
+    });
+
+    // ===== Schedule Follow-Up Notification =====
+    await db.collection('scheduled_appointment_notifications')
+      .doc(docRef.id)
+      .set({
+        appointmentId: docRef.id,
+        sendTime: admin.firestore.Timestamp.fromDate(endDate),
+        client_id: clientId,
+        client_name: `${clientFirstName} ${clientLastName}`.trim(),
+        receiverIds: ['admin'],
+        createdAt: admin.firestore.Timestamp.now(),
+        createdAtFormatted: new Date().toISOString(),
+        desc: `Follow-up dell'appuntamento per ${clientFirstName}`,
+        type: 'appointment_followup',
+        status: ['admin'],
+        notification_status: 'pending',
+        ttl: admin.firestore.Timestamp.fromDate(new Date(endDate.getTime() + 30 * 24 * 60 * 60 * 1000)),
+      });
+
+    return { success: true, appointmentId: docRef.id };
+
+  } catch (error) {
+    console.error('❌ Error in createSingleAppointment:', error);
+    throw new Error(error.message);
+  }
+});
+
+
+exports.updateAppointment = onCall(async (request) => {
+  try {
+    const {
+      appointmentId,
+      startDates,
+      originalStart,
+      originalEnd,
+      number,
+      email,
+      clientId,
+      serviceIds,
+      duration,
+      employeeIds,
+      statusId,
+      colorId,
+      notes,
+      clientFirstName,
+      clientLastName,
+    } = request.data;
+
+    const originalStartDate = new Date(originalStart);
+    const originalEndDate = new Date(originalEnd);
+    const timeDiffMs = originalEndDate - originalStartDate;
+
+    for (const startStr of startDates) {
+      const start = new Date(startStr);
+      const end = new Date(start.getTime() + timeDiffMs);
+      const timestamp = admin.firestore.Timestamp.fromDate(start);
+      const time = start.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+
+      const updateData = {
+        date: start.toISOString(),
+        time,
+        date_timestamp: timestamp,
+        notes: notes || '',
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+        total_duration: duration,
+        employee_id_list: employeeIds,
+        treatment_id_list: serviceIds,
+        status_id: statusId,
+        color_id: colorId,
+        number,
+        email,
+        client_id: clientId,
+      };
+
+      await db.collection('appointments').doc(appointmentId).set(updateData, { merge: true });
+
+      const updatedSnap = await db.collection('appointments').doc(appointmentId).get();
+      const data = updatedSnap.data();
+
+      // ===== Google Calendar Sync =====
+      try {
+        const response = await fetch('https://us-central1-aetherium-salon.cloudfunctions.net/googleCalendarEvent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            operation: 'UPDATE',
+            appointment_id: appointmentId,
+            appointment: {
+              ...data,
+              date_timestamp: {
+                _time_: data.date_timestamp.toDate().toISOString(),
+              },
+            },
+          }),
+        });
+
+        if (response.status !== 200) {
+          throw new Error(await response.text());
+        }
+      } catch (calendarErr) {
+        console.error('❌ Calendar Update Failed:', calendarErr);
+      }
+
+      // ===== Follow-Up Notification Update =====
+      await db.collection('scheduled_appointment_notifications')
+        .doc(appointmentId)
+        .set({
+          sendTime: admin.firestore.Timestamp.fromDate(end),
+          updatedAt: admin.firestore.Timestamp.now(),
+          client_id: clientId,
+          client_name: `${clientFirstName} ${clientLastName}`.trim(),
+        }, { merge: true });
+    }
+
+    return { success: true, message: 'Appointment(s) updated successfully' };
+
+  } catch (error) {
+    console.error('❌ Error in updateAppointment:', error);
+    throw new Error(error.message);
+  }
+});
+
+exports.deleteAppointment = onCall(async (request) => {
+  try {
+    const { appointmentId } = request.data;
+    if (!appointmentId) throw new Error('Missing appointmentId');
+
+    const appointmentRef = db.collection('appointments').doc(appointmentId);
+    const appointmentSnap = await appointmentRef.get();
+
+    if (!appointmentSnap.exists) {
+      return { success: false, message: 'Appointment not found' };
+    }
+
+    const data = appointmentSnap.data();
+    const calendarEventId = data?.google_calendar_event_id;
+
+    await appointmentRef.delete();
+
+    // ===== Delete from Google Calendar =====
+    try {
+      const response = await fetch('https://us-central1-aetherium-salon.cloudfunctions.net/googleCalendarEvent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          operation: 'DELETE',
+          appointment_id: appointmentId,
+          calendar_event_id: calendarEventId,
+        }),
+      });
+
+      if (response.status !== 200) {
+        throw new Error(await response.text());
+      }
+    } catch (calendarErr) {
+      console.error('❌ Calendar Deletion Failed:', calendarErr);
+    }
+
+    // ===== Remove scheduled follow-up =====
+    await db.collection('scheduled_appointment_notifications').doc(appointmentId).delete().catch((err) => {
+      console.warn('⚠️ Failed to delete follow-up notification:', err);
+    });
+
+    return { success: true, message: 'Appointment deleted successfully' };
+
+  } catch (error) {
+    console.error('❌ Error in deleteAppointment:', error);
+    throw new Error(error.message);
   }
 });
 
@@ -405,7 +821,8 @@ exports.scheduleFollowUpNotification = onDocumentCreated("appointments/{appointm
       client_id: appointment.client_id,
       client_name,
       receiverIds: adminIds,
-      status: "pending",
+      status: adminIds,
+      notification_status: "pending",
       ttl
     };
 
@@ -532,7 +949,7 @@ exports.sendNotification = onDocumentCreated("new_notification/{docId}", async (
 // ========== SCHEDULED FUNCTIONS ==========
 
 exports.processScheduledNotifications = onSchedule({
-  schedule: "*/5 * * * *",
+  schedule: "*/30 * * * *",
   timeZone: EUROPE_ROME,
 }, async () => {
   logger.info("Running scheduled job: processScheduledNotifications");
@@ -547,7 +964,7 @@ exports.processScheduledNotifications = onSchedule({
       .collection("scheduled_appointment_notifications")
       .where("sendTime", ">", fiveMinutesAgo)
       .where("sendTime", "<=", now)
-      .where("status", "==", "pending")
+      .where("notification_status", "==", "pending")
       .get();
 
     if (snapshot.empty) {
@@ -564,10 +981,10 @@ exports.processScheduledNotifications = onSchedule({
       // Acquire lease transactionally
       const leased = await db.runTransaction(async (tx) => {
         const snap = await tx.get(docRef);
-        if (!snap.exists || snap.get("status") !== "pending") return false;
+        if (!snap.exists || snap.get("notification_status") !== "pending") return false;
 
         tx.update(docRef, {
-          status: "processing",
+          notification_status: "processing",
           processingAt: getTimestampNowRome(),
         });
         return true;
@@ -609,12 +1026,12 @@ exports.processScheduledNotifications = onSchedule({
           desc: `Follow-up dell'appuntamento per ${client_name}`,
           type: "appointment_followup",
           appointmentId,
-          client_id: appointmentData.client_id || null,
+          client_id: [appointmentData.client_id] || null,
           actions: [
-            { id: "yes", title: "È venuto", action: "appointment_attended" },
-            { id: "no", title: "Non si è presentato", action: "appointment_no_show" }
+            { id: "Si", title: "Conferma", action: "appointment_attended" },
+            { id: "No", title: "No Show", action: "appointment_no_show" }
           ],
-          status: "pending",
+          notification_status: "pending",
           ttl: toTimestampRome(nowRome.clone().add(7, 'days')),
         };
 
@@ -622,7 +1039,7 @@ exports.processScheduledNotifications = onSchedule({
 
         // Mark as sent
         await docRef.update({
-          status: "sent",
+          notification_status: "sent",
           sentAt: getTimestampNowRome(),
           sentAtFormatted: nowRome.format("YYYY-MM-DD HH:mm:ss"),
         });
@@ -632,7 +1049,7 @@ exports.processScheduledNotifications = onSchedule({
       } catch (error) {
         logger.error(`Error processing appointmentId ${appointmentId}:`, error.message);
         await docRef.update({
-          status: "failed",
+          notification_status: "failed",
           error: error.message,
           failedAt: getTimestampNowRome(),
         });
@@ -648,7 +1065,7 @@ exports.processScheduledNotifications = onSchedule({
   }
 });
 
-exports.scheduledCalendarSync = onSchedule("*/30 * * * *", async () => {
+exports.scheduledCalendarSync = onSchedule("*/5 * * * *", async () => {
   const startTime = Date.now();
   logger.info("Starting optimized calendar sync...");
   
@@ -841,7 +1258,7 @@ exports.expireOldPendingNotifications = onSchedule({
   try {
     const snapshot = await db
       .collection("new_notification")
-      .where("status", "==", "pending")
+      .where("notification_status", "==", "pending")
       .where("createdAt", "<=", twoDaysAgo)
       .get();
 
@@ -854,7 +1271,7 @@ exports.expireOldPendingNotifications = onSchedule({
     const batch = db.batch();
     snapshot.docs.forEach(doc => {
       batch.update(doc.ref, {
-        status: "failed",
+        notification_status: "failed",
         expiredAt: now,
       });
     });
