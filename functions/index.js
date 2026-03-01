@@ -895,58 +895,11 @@ exports.onTreatmentCategoryChange = onDocumentWritten("treatment_categories/{cat
 
 
 exports.backfillRenewalDates = onRequest(async (req, res) => {
-  res.set("Access-Control-Allow-Origin", "*");
-
-  try {
-    const membershipsSnap = await db.collection("client_memberships").get();
-    if (membershipsSnap.empty) {
-      return res.status(200).json({ message: "No memberships found." });
-    }
-
-    const batch = db.batch();
-    let updated = 0;
-
-    for (const doc of membershipsSnap.docs) {
-      const data = doc.data();
-      const { client_id, start_date, renewal_date } = data;
-
-      if (!client_id || !start_date) {
-        console.warn(`⚠️ Skipping client ${doc.id} — missing client_id or start_date`);
-        continue;
-      }
-
-      // If renewal_date already exists, skip
-      if (renewal_date) continue;
-
-      // Compute next renewal date from start_date
-      const startMoment = moment(start_date, "DD/MM/YYYY");
-      if (!startMoment.isValid()) {
-        console.warn(`⚠️ Invalid start_date for client ${client_id}: ${start_date}`);
-        continue;
-      }
-
-      const renewalMoment = startMoment.clone().add(1, "year");
-      const renewalStr = renewalMoment.format("YYYY-MM-DD");
-
-      batch.update(doc.ref, { renewal_date: renewalStr });
-      updated++;
-
-      // Firestore batch safety
-      if (updated % 450 === 0) {
-        await batch.commit();
-        console.log(`✅ Committed ${updated} so far...`);
-      }
-    }
-
-    if (updated % 450 !== 0) await batch.commit();
-
-    res.status(200).json({
-      message: `✅ Backfill complete: ${updated} memberships updated with renewal_date`,
-    });
-  } catch (error) {
-    console.error("❌ backfillRenewalDates error:", error);
-    res.status(500).json({ error: error.message });
-  }
+  // Migration complete — endpoint disabled
+  return res.status(410).json({
+    error: "Migration complete",
+    message: "This endpoint is no longer available.",
+  });
 });
 
 exports.unlockClient = onCall(async (request) => {
@@ -1057,19 +1010,22 @@ exports.ignoreNotification = onRequest(async (req, res) => {
     
     if (!preReadSnap.exists) {
       logger.warn(`❌ [${requestId}] Pre-transaction: Document does NOT exist`);
-    } else {
-      const preData = preReadSnap.data();
-      logger.info(`✅ [${requestId}] Pre-transaction: Document EXISTS`);
-      logger.info(`   Document ID: ${preReadSnap.id}`);
-      logger.info(`   Type: ${preData.type}`);
-      logger.info(`   Title: ${preData.title}`);
-      logger.info(`   Status array: [${(preData.status || []).join(', ')}]`);
-      logger.info(`   Status length: ${(preData.status || []).length}`);
-      logger.info(`   ReceiverIds: [${(preData.receiverIds || []).join(', ')}]`);
-      logger.info(`   User ${user_id} in status: ${(preData.status || []).includes(user_id)}`);
-      logger.info(`   Created at: ${preData.createdAt?.toDate?.()?.toISOString() || 'N/A'}`);
-      logger.info(`   FCM sent: ${preData.fcmSent}`);
+      return res.status(404).json({ error: "Notification not found" });
     }
+
+    const preData = preReadSnap.data();
+
+    // ─────────────────────────────────────────────────────
+    // OWNERSHIP CHECK: user can only dismiss their own notifications
+    // ─────────────────────────────────────────────────────
+    if (!(preData.status || []).includes(user_id)) {
+      logger.warn(`❌ [${requestId}] User ${user_id} not in status array — not authorized`);
+      return res.status(403).json({ error: "Not authorized to dismiss this notification" });
+    }
+
+    logger.info(`✅ [${requestId}] Pre-transaction: Document EXISTS`);
+    logger.info(`   Status array: [${(preData.status || []).join(', ')}]`);
+    logger.info(`   User ${user_id} in status: true`);
 
     logger.info(`🔄 [${requestId}] Executing transaction...`);
     const transactionStartTime = Date.now();
@@ -1238,9 +1194,31 @@ exports.ignoreNotification = onRequest(async (req, res) => {
 });
 
 // Consolidated user management
+// TODO: Implement rate limiting using Firebase App Check or
+// in-memory counter with IP/UID tracking
+
 exports.manageUsers = onRequest(async (req, res) => {
+  // ─────────────────────────────────────────────────────
+  // AUTH: Verify admin Firebase ID token
+  // ─────────────────────────────────────────────────────
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Missing authorization header" });
+  }
+
+  try {
+    const idToken = authHeader.split("Bearer ")[1];
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const isAdmin = await verifyIsAdmin(decoded.uid);
+    if (!isAdmin) {
+      return res.status(403).json({ error: "Only admins can manage users" });
+    }
+  } catch (authErr) {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+
   const { action, email, password, uid } = req.body;
-  
+
   try {
     switch (action) {
       case 'create':
@@ -1547,14 +1525,33 @@ exports.manageUsers = onRequest(async (req, res) => {
      ========================================================= */
   exports.getAppointment = onCall(async (request) => {
     try {
+      const callerUid = request.auth?.uid;
+      if (!callerUid) {
+        throw new HttpsError("unauthenticated", "Authentication required.");
+      }
+
       const { appointmentId } = request.data || {};
-      if (!appointmentId) throw new Error("Missing appointmentId");
-      const snap = await db.collection("appointments").doc(appointmentId).get();
+      if (!appointmentId) {
+        throw new HttpsError("invalid-argument", "Missing appointmentId");
+      }
+
+      const [isAdmin, snap] = await Promise.all([
+        verifyIsAdmin(callerUid),
+        db.collection("appointments").doc(appointmentId).get(),
+      ]);
+
       if (!snap.exists) return { success: false, message: "Appointment not found" };
-      return { success: true, data: { id: snap.id, ...snap.data() } };
+
+      const appointmentData = snap.data();
+      if (!isAdmin && appointmentData.client_id !== callerUid) {
+        throw new HttpsError("permission-denied", "Cannot view other users' appointments.");
+      }
+
+      return { success: true, data: { id: snap.id, ...appointmentData } };
     } catch (err) {
       console.error("❌ getAppointment error:", err);
-      throw new Error(err.message);
+      if (err instanceof HttpsError) throw err;
+      throw new HttpsError("internal", err.message);
     }
   });
 
@@ -1935,19 +1932,29 @@ exports.handleAppointmentRequest = onCall(async (request) => {
 
   exports.listAppointments = onCall(async (request) => {
     try {
-      const { 
-        clientId, 
-        employeeId, 
-        dateFrom, 
-        dateTo, 
-        limit = 20,  // ✅ Lower default limit
-        startAfter,  // ✅ Pagination cursor
+      const callerUid = request.auth?.uid;
+      if (!callerUid) {
+        throw new HttpsError("unauthenticated", "Authentication required.");
+      }
+
+      const isAdmin = await verifyIsAdmin(callerUid);
+
+      const {
+        clientId,
+        employeeId,
+        dateFrom,
+        dateTo,
+        limit = 20,
+        startAfter,
       } = request.data || {};
-      
+
+      // Non-admins can ONLY see their own appointments
+      const effectiveClientId = isAdmin ? clientId : callerUid;
+
       let q = db.collection("appointments");
-  
-      if (clientId) q = q.where("client_id", "==", clientId);
-      if (employeeId) q = q.where("employee_id_list", "array-contains", employeeId);
+
+      if (effectiveClientId) q = q.where("client_id", "==", effectiveClientId);
+      if (isAdmin && employeeId) q = q.where("employee_id_list", "array-contains", employeeId);
       
       if (dateFrom) {
         const fromDate = parseAsUTC(dateFrom);
