@@ -172,8 +172,9 @@ async function syncWithGoogleCalendar(operation, appointmentId, appointmentData 
       
       const res = await fetch(endpoint, {
         method: "POST",
-        headers: { 
+        headers: {
           "Content-Type": "application/json",
+          "Authorization": `Bearer ${process.env.CALENDAR_API_KEY}`,
           "X-Request-ID": `${appointmentId}-${Date.now()}` // For tracking
         },
         body: JSON.stringify(body),
