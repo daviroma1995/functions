@@ -1741,7 +1741,7 @@ exports.createAppointmentRequest = onCall(async (request) => {
           appointmentId,
           requestId: requestRef.id,
           notificationId: notificationRef.id,
-        });
+        }, adminIds);
         fcmSuccessCount = fcmResult.successCount;
         fcmFailureCount = fcmResult.failureCount;
       }
@@ -1894,7 +1894,7 @@ exports.handleAppointmentRequest = onCall(async (request) => {
           requestId,
           action,
           notificationId: notificationRef.id,
-        });
+        }, [clientId]);
         fcmSuccessCount = fcmResult.successCount;
         fcmFailureCount = fcmResult.failureCount;
       }
@@ -2174,7 +2174,7 @@ exports.sendNotification = onDocumentCreated("new_notification/{docId}", async (
     if (data.appointmentId) fcmData.appointmentId = data.appointmentId;
     if (data.link) fcmData.link = data.link;
 
-    const result = await sendFcm(tokens, data.title, data.body, fcmData);
+    const result = await sendFcm(tokens, data.title, data.body, fcmData, data.receiverIds || []);
 
     await event.data.ref.update({
       fcmSent: true,
@@ -2269,7 +2269,7 @@ exports.sendNotification = onDocumentCreated("new_notification/{docId}", async (
               type: "appointment_new",
               appointmentId: appointmentId,
               notificationId: notificationRef.id,
-            });
+            }, receivers);
             fcmSuccessCount = fcmResult.successCount;
             fcmFailureCount = fcmResult.failureCount;
             logger.info(`✅ [Background] FCM sent: ${fcmSuccessCount} success, ${fcmFailureCount} failed`);
@@ -2471,7 +2471,7 @@ exports.onAppointmentUpdatedBackground = onDocumentUpdated("appointments/{appoin
             type: "appointment_update",
             appointmentId: appointmentId,
             notificationId: notificationRef.id,
-          });
+          }, receivers);
           fcmSuccessCount = fcmResult.successCount;
           fcmFailureCount = fcmResult.failureCount;
           logger.info(`✅ [Background] FCM sent: ${fcmSuccessCount} success, ${fcmFailureCount} failed`);
@@ -2601,7 +2601,7 @@ exports.onAppointmentUpdatedBackground = onDocumentUpdated("appointments/{appoin
               type: "appointment_delete",
               appointmentId: appointmentId,
               notificationId: notificationRef.id,
-            });
+            }, receivers);
             fcmSuccessCount = fcmResult.successCount;
             fcmFailureCount = fcmResult.failureCount;
             logger.info(`✅ [Background] FCM sent: ${fcmSuccessCount} success, ${fcmFailureCount} failed`);
@@ -2773,7 +2773,7 @@ exports.testNotification = onCall(async (request) => {
         const fcmResult = await sendFcm(tokens, template.title, template.body, {
           ...template.data,
           notificationId: notificationRef.id,
-        });
+        }, [clientId]);
 
         // Save notification with FCM status
         await notificationRef.set({
@@ -3494,7 +3494,7 @@ exports.processScheduledNotifications = onSchedule({
             appointmentId: s.appointmentId,
             notificationId: notificationRef.id,
             link: "https://g.page/r/CQvE4blXs4esEAE/review",
-          });
+          }, [s.clientId]);
           fcmSuccessCount = fcmResult.successCount;
           fcmFailureCount = fcmResult.failureCount;
           logger.info(`✅ [${docId}] FCM result: ${fcmSuccessCount} success, ${fcmFailureCount} failed`);
@@ -3606,7 +3606,7 @@ exports.processScheduledNotifications = onSchedule({
           };
           logger.info(`   FCM payload: ${JSON.stringify(fcmPayload)}`);
           
-          const fcmResult = await sendFcm(tokens, title, body, fcmPayload);
+          const fcmResult = await sendFcm(tokens, title, body, fcmPayload, s.receiverIds);
           fcmSuccessCount = fcmResult.successCount;
           fcmFailureCount = fcmResult.failureCount;
           
@@ -3798,12 +3798,11 @@ async function getCachedUserName(userId) {
  */
 async function getFcmTokens(userIds) {
   logger.info(`🔑 getFcmTokens called for ${userIds.length} users`);
-  
+
   const docs = await Promise.all(
     userIds.map(async (id) => {
-      // ✅ FIXED: Look in "clients" collection, not "users"
       const doc = await db.collection("clients").doc(id).get();
-      
+
       if (!doc.exists) {
         logger.warn(`   User ${id}: NOT FOUND in clients collection`);
       } else {
@@ -3811,7 +3810,7 @@ async function getFcmTokens(userIds) {
         const hasToken = !!(data?.fcmToken || data?.fcmTokens?.length);
         logger.info(`   User ${id}: ${hasToken ? '✅ HAS TOKEN' : '❌ NO TOKEN'}`);
       }
-      
+
       return doc;
     })
   );
@@ -3825,8 +3824,50 @@ async function getFcmTokens(userIds) {
 
   const uniqueTokens = [...new Set(tokens)];
   logger.info(`🔑 getFcmTokens result: ${uniqueTokens.length} unique tokens found`);
-  
+
   return uniqueTokens;
+}
+
+/**
+ * Returns a map of { token -> userId } for per-user FCM customization (e.g. badge).
+ * @param {string[]} userIds
+ * @returns {Promise<Map<string, string>>} token → userId
+ */
+async function getFcmTokenMap(userIds) {
+  const tokenMap = new Map();
+
+  await Promise.all(
+    userIds.map(async (id) => {
+      const doc = await db.collection("clients").doc(id).get();
+      if (!doc.exists) return;
+      const data = doc.data();
+      const t = data?.fcmTokens || data?.fcmToken;
+      const tokenList = Array.isArray(t) ? t : t ? [t] : [];
+      for (const token of tokenList) {
+        tokenMap.set(token, id);
+      }
+    })
+  );
+
+  return tokenMap;
+}
+
+/**
+ * Queries actual unread notification count for a user.
+ * @param {string} userId
+ * @returns {Promise<number>}
+ */
+async function getUnreadCount(userId) {
+  try {
+    const snap = await db.collection("new_notification")
+      .where("status", "array-contains", userId)
+      .count()
+      .get();
+    return snap.data().count;
+  } catch (err) {
+    logger.warn(`⚠️ getUnreadCount failed for ${userId}: ${err.message}`);
+    return 1; // Fallback to 1 so badge is visible
+  }
 }
 
 // ============================================================
@@ -3855,7 +3896,7 @@ async function getFcmTokens(userIds) {
  * @param {Object} data - Custom data payload (type, appointmentId, actions, etc.)
  * @returns {Promise<Object>} - FCM response with successCount, failureCount, responses
  */
-async function sendFcm(tokens, title, body, data = {}) {
+async function sendFcm(tokens, title, body, data = {}, receiverIds = []) {
   if (!tokens || tokens.length === 0) {
     logger.warn("⚠️ sendFcm: No tokens provided");
     return { successCount: 0, failureCount: 0, responses: [] };
@@ -3870,64 +3911,76 @@ async function sendFcm(tokens, title, body, data = {}) {
   }
 
   // ✅ KEY: Tell Flutter to only show local notification in foreground
-  // In background, system notification (from android.notification) is already shown
   stringData.showLocalNotification = "foreground_only";
 
   const isFollowUp = data.type === "appointment_followup";
-
-  // Use the correct Android channel based on notification type
-  const androidChannelId = isFollowUp 
-    ? "APPOINTMENT_FOLLOWUP_CHANNEL" 
+  const androidChannelId = isFollowUp
+    ? "APPOINTMENT_FOLLOWUP_CHANNEL"
     : "high_importance_channel";
 
-  const message = {
-    tokens,
+  // ─────────────────────────────────────────────────────
+  // iOS BADGE: query actual unread count per user
+  // ─────────────────────────────────────────────────────
+  let tokenToUser = new Map();
+  const badgeCache = new Map(); // userId → unread count
 
-    // ========== DATA PAYLOAD (Flutter reads this in all states) ==========
-    data: stringData,
+  if (receiverIds.length > 0) {
+    tokenToUser = await getFcmTokenMap(receiverIds);
+    // Query unread counts in parallel for all receivers
+    await Promise.all(
+      receiverIds.map(async (uid) => {
+        badgeCache.set(uid, await getUnreadCount(uid));
+      })
+    );
+  }
 
-    // ========== ANDROID CONFIG ==========
-    android: {
-      priority: "high",
-      ttl: 86400000, // 24 hours in milliseconds
-      
-      // ✅ REQUIRED: This makes notifications appear in background/killed state
-      // System displays this automatically when app is not in foreground
-      notification: {
-        title: title,
-        body: body,
-        channelId: androidChannelId, // Must match Flutter's registered channel
+  // ─────────────────────────────────────────────────────
+  // Build per-token messages (each gets correct badge)
+  // ─────────────────────────────────────────────────────
+  const messages = tokens.map((token) => {
+    const userId = tokenToUser.get(token);
+    // +1 because this notification hasn't been written to Firestore yet
+    const badge = userId && badgeCache.has(userId)
+      ? badgeCache.get(userId) + 1
+      : 1;
+
+    return {
+      token,
+      data: stringData,
+      android: {
         priority: "high",
-        defaultSound: true,
-        defaultVibrateTimings: true,
-        // Tag prevents duplicate notifications for same appointment
-        tag: data.appointmentId || data.notificationId || "aetherium",
-      },
-    },
-
-    // ========== iOS (APNs) CONFIG ==========
-    apns: {
-      payload: {
-        aps: {
-          alert: { title, body },
-          sound: "default",
-          badge: 1,
-          "mutable-content": 1,
-          // Category for actionable notifications (follow-up with Yes/No buttons)
-          ...(isFollowUp && { category: "APPOINTMENT_FOLLOWUP" }),
+        ttl: 86400000,
+        notification: {
+          title,
+          body,
+          channelId: androidChannelId,
+          priority: "high",
+          defaultSound: true,
+          defaultVibrateTimings: true,
+          tag: data.appointmentId || data.notificationId || "aetherium",
         },
-        // Include custom data for iOS
-        ...stringData,
       },
-      headers: {
-        "apns-priority": "10",
-        "apns-push-type": "alert",
+      apns: {
+        payload: {
+          aps: {
+            alert: { title, body },
+            sound: "default",
+            badge,
+            "mutable-content": 1,
+            ...(isFollowUp && { category: "APPOINTMENT_FOLLOWUP" }),
+          },
+          ...stringData,
+        },
+        headers: {
+          "apns-priority": "10",
+          "apns-push-type": "alert",
+        },
       },
-    },
-  };
+    };
+  });
 
   try {
-    const res = await admin.messaging().sendEachForMulticast(message);
+    const res = await admin.messaging().sendEach(messages);
 
     if (res.failureCount > 0) {
       logger.warn(`⚠️ FCM: ${res.successCount} sent, ${res.failureCount} failed`);
