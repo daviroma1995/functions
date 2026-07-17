@@ -1199,50 +1199,63 @@ exports.ignoreNotification = onRequest(async (req, res) => {
 // TODO: Implement rate limiting using Firebase App Check or
 // in-memory counter with IP/UID tracking
 
-exports.manageUsers = onRequest(async (req, res) => {
+exports.manageUsers = onCall(async (request) => {
   // ─────────────────────────────────────────────────────
-  // AUTH: Verify admin Firebase ID token
+  // AUTH: onCall verifies the Firebase ID token itself and populates
+  // request.auth, so the hand-rolled Bearer-header parsing the onRequest
+  // version did is now the SDK's job. The admin gate is unchanged: the same
+  // verifyIsAdmin(uid) reading clients/{uid}.isAdmin === true.
   // ─────────────────────────────────────────────────────
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Missing authorization header" });
+  const callerUid = request.auth?.uid;
+  if (!callerUid) {
+    throw new HttpsError("unauthenticated", "Authentication required.");
   }
 
-  try {
-    const idToken = authHeader.split("Bearer ")[1];
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    const isAdmin = await verifyIsAdmin(decoded.uid);
-    if (!isAdmin) {
-      return res.status(403).json({ error: "Only admins can manage users" });
-    }
-  } catch (authErr) {
-    return res.status(401).json({ error: "Invalid or expired token" });
+  const isAdmin = await verifyIsAdmin(callerUid);
+  if (!isAdmin) {
+    throw new HttpsError("permission-denied", "Only admins can manage users");
   }
 
-  const { action, email, password, uid } = req.body;
+  // httpsCallable sends the payload nested under `data`. Reading req.body
+  // directly is what made every call 400 with action === undefined.
+  const { action, email, password, uid } = request.data || {};
 
   try {
     switch (action) {
-      case 'create':
+      case 'create': {
         if (!email || !password) {
-          return res.status(400).json({ error: "Email and password required for creation" });
+          throw new HttpsError("invalid-argument", "Email and password required for creation");
         }
         const userData = await admin.auth().createUser({ email, password });
-        return res.status(200).json(userData);
-        
-      case 'delete':
+        // What is returned here is what the app sees as result.data —
+        // add_new_client_controller.dart:337 reads result.data['uid'].
+        return { uid: userData.uid, email: userData.email };
+      }
+
+      case 'delete': {
         if (!uid) {
-          return res.status(400).json({ error: "UID required for deletion" });
+          throw new HttpsError("invalid-argument", "UID required for deletion");
         }
         await admin.auth().deleteUser(uid);
-        return res.status(200).json({ success: true, message: "User deleted" });
-        
+        return { success: true, message: "User deleted" };
+      }
+
       default:
-        return res.status(400).json({ error: "Invalid action. Use 'create' or 'delete'" });
+        throw new HttpsError("invalid-argument", "Invalid action. Use 'create' or 'delete'");
     }
   } catch (error) {
-    logger.error(`User management error for action ${action}:`, error);
-    return res.status(500).json({ error: error.message });
+    // Re-throw an HttpsError untouched — wrapping it below would flatten its
+    // code to 'internal' and the app would lose the reason.
+    if (error instanceof HttpsError) throw error;
+
+    // A duplicate email must reach the app as 'already-exists' so that
+    // add_new_client_controller.dart:393 can show "Email già in uso".
+    if (error.code === "auth/email-already-exists") {
+      throw new HttpsError("already-exists", "Email already in use");
+    }
+
+    logger.error(`User management error for action ${action}: ${error.code || "unknown"} ${error.message}`);
+    throw new HttpsError("internal", error.message);
   }
 });
 
