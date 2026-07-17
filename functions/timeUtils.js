@@ -319,6 +319,11 @@ function getDurationMinutesFromInputs(startInput, endInput) {
  * // No timezone provided, parses from offset → stores 09:00
  * toLocalTimestamp("2025-12-12T09:00:00+01:00")
  */
+// ⚠️ DEPRECATED — DO NOT USE. Stores wall-clock-as-UTC: it resolves the correct
+// instant, then discards the offset by re-stamping the local components via Date.UTC.
+// The result is a Timestamp labelled 'Z' that is NOT the true instant, and the source
+// timezone is destroyed irrecoverably. Was used by scheduledCalendarSync; replaced by
+// toUTCTimestamp(). Kept only so this comment is findable. Use toUTCTimestamp instead.
 function toLocalTimestamp(dateTimeStr, eventTimeZone) {
   if (!dateTimeStr) {
     throw new Error("dateTimeStr is required for toLocalTimestamp");
@@ -380,6 +385,9 @@ function toLocalTimestamp(dateTimeStr, eventTimeZone) {
  * formatTimeLocal("2025-12-12T09:00:00+01:00", "Europe/Rome") // → "09:00"
  * formatTimeLocal("2025-12-12T14:30:00-05:00", "America/New_York") // → "14:30"
  */
+// ⚠️ DEPRECATED — DO NOT USE for the salon's display strings. Returns the wall clock of
+// the event's SOURCE zone (a New York event renders "08:30", not the Rome "14:30" the
+// salon needs). Replaced in scheduledCalendarSync by formatTimeRome(). Use that instead.
 function formatTimeLocal(dateTimeStr, eventTimeZone) {
   if (!dateTimeStr) {
     throw new Error("dateTimeStr is required for formatTimeLocal");

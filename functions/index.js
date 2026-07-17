@@ -3,6 +3,7 @@ const { onRequest, onCall, HttpsError } = require('firebase-functions/v2/https')
 const { google } = require('googleapis');
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const moment = require('moment-timezone');
+const crypto = require('crypto');
 const admin = require("firebase-admin");
 const { logger } = require("firebase-functions");
 
@@ -20,9 +21,9 @@ const {
   createTTL,                    // For: ttl fields
   getTimestampDaysAgo,          // For: cleanup queries
   getDurationMinutes,           // For: calculating duration (Date objects)
-  // ✅ Timezone-agnostic functions for Google Calendar sync
-  toLocalTimestamp,             // For: storing local time from calendar events
-  formatTimeLocal,              // For: formatting time using event's timezone
+  // ✅ Google Calendar sync: store the TRUE instant, display in Rome
+  toUTCTimestamp,               // For: storing the true UTC instant from calendar events
+  formatTimeRome,               // For: the `time` display string (salon's zone)
   isPastLocal,                  // For: checking if past using event's timezone
   // ✅ Defensive parsing
   parseAsUTC,                   // For: listAppointments date filters
@@ -2218,7 +2219,7 @@ exports.sendNotification = onDocumentCreated("new_notification/{docId}", async (
       logger.info(`⏭️ [Background] Skipping Google Calendar appointment ${appointmentId}`);
       return;
     }
-  
+
     try {
       // ==========================================================
       // TASK 1: AWARD MEMBERSHIP POINTS (if applicable)
@@ -3108,8 +3109,26 @@ exports.scheduledCalendarSync = onSchedule("*/15 * * * *", async () => {
               .where("google_calendar_event_id", "==", eventId)
               .get();
 
-            delQuery.docs.forEach((doc) => batch.delete(doc.ref));
-            deletedCount += delQuery.size;
+            delQuery.docs.forEach((doc) => {
+              // ✅ GUARD: staff converted this event into a real appointment and
+              // filled in client / service / price. A Google-side delete must not
+              // destroy that data — archive it and let staff decide. Without this,
+              // deleting the event in Google silently wipes the booking.
+              if (doc.data().from_calendar_appointment === true) {
+                batch.update(doc.ref, {
+                  google_event_deleted: true,
+                  google_deleted_at: getNowTimestamp(),
+                  from_google_calendar: false,
+                });
+                logger.warn(`Event ${eventId} deleted in Google but converted in app — archiving, not deleting`);
+              } else {
+                // A pure provisional mirror of a now-deleted event. Nothing of
+                // value to keep.
+                batch.delete(doc.ref);
+                deletedCount++;
+              }
+              batchOps++;
+            });
             continue;
           }
 
@@ -3169,10 +3188,13 @@ exports.scheduledCalendarSync = onSchedule("*/15 * * * *", async () => {
           // ✅ TIMEZONE-AGNOSTIC: Extract event timezone
           const eventTimeZone = event.start?.timeZone || event.end?.timeZone;
 
-          // ✅ TIMEZONE-AGNOSTIC: Store local time (not UTC)
-          const startTimestamp = toLocalTimestamp(startDateStr, eventTimeZone);
-          const endTimestamp = toLocalTimestamp(endDateStr, eventTimeZone);
-          const timeDisplay = formatTimeLocal(startDateStr, eventTimeZone);
+          // ✅ Store the TRUE UTC instant. Google's dateTime already carries its own
+          // offset (e.g. "2026-07-22T08:30:00-04:00"), so parsing it yields the correct
+          // absolute time regardless of the event's source timezone.
+          const startTimestamp = toUTCTimestamp(startDateStr);
+          const endTimestamp = toUTCTimestamp(endDateStr);
+          // Display string: Rome (the salon's zone), derived from that true instant.
+          const timeDisplay = formatTimeRome(startDateStr);
 
           // ✅ Duration calculation (still works correctly)
           const startDate = new Date(startDateStr);
@@ -4063,4 +4085,91 @@ exports.expireOldPendingNotifications = onSchedule({
   }
 
   return null;
+});
+
+/* =========================================================
+   📆 CALENDAR SYNC v2 — webhook + incremental (see calendarSyncV2.js)
+   The old `scheduledCalendarSync` above is UNTOUCHED and still running as
+   the safety net. Both paths reconcile on google_calendar_event_id.
+   ========================================================= */
+const { defineSecret } = require("firebase-functions/params");
+const CALENDAR_WEBHOOK_TOKEN = defineSecret("CALENDAR_WEBHOOK_TOKEN");
+
+const calendarSyncV2 = require("./calendarSyncV2")({
+  db, google, logger, getAuth, CALENDAR_ID,
+  toUTCTimestamp, formatTimeRome, isPastLocal, getDurationMinutes,
+  getNowTimestamp, STATUS_ARCHIVIATO, STATUS_CONFERMATO,
+});
+
+/**
+ * Google pokes this on any calendar change. The poke is bodyless — it carries
+ * no event id, only "something changed" — so we answer it by asking
+ * events.list what actually moved.
+ */
+exports.calendarWebhook = onRequest(
+  { secrets: [CALENDAR_WEBHOOK_TOKEN] },
+  async (req, res) => {
+    const state = req.get("X-Goog-Resource-State");
+    const supplied = req.get("X-Goog-Channel-Token") || "";
+    const expected = CALENDAR_WEBHOOK_TOKEN.value();
+
+    // Constant-time compare. Buffers of unequal length throw in
+    // timingSafeEqual, so the length check has to come first — and it leaks
+    // only the token's length, which is not the secret.
+    const a = Buffer.from(supplied);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      logger.warn("[syncV2] webhook rejected: bad channel token");
+      res.status(401).send("unauthorized");
+      return;
+    }
+
+    // The handshake Google fires when the channel is created. Not a change.
+    if (state === "sync") {
+      logger.info("[syncV2] webhook handshake OK");
+      res.status(200).send("ok");
+      return;
+    }
+
+    // Sync BEFORE responding. On Cloud Run (which gen2 functions are) CPU is
+    // throttled as soon as the response is sent, so anything awaited after
+    // res.send() may never run — an earlier version of this ack'd first and the
+    // sync silently never executed. A run is ~2s, well inside Google's timeout.
+    try {
+      await calendarSyncV2.runIncrementalSync(CALENDAR_ID);
+      res.status(200).send("ok");
+    } catch (err) {
+      logger.error(`[syncV2] webhook sync failed: ${err.message}`, err);
+      // Non-2xx tells Google to retry — the sync is idempotent, so a retry is
+      // safe and is how we recover from a transient Calendar/Firestore blip.
+      res.status(500).send("sync failed");
+    }
+  }
+);
+
+/** One-shot admin trigger: register (or re-register) the watch channel. */
+exports.registerCalendarWatch = onCall(
+  { secrets: [CALENDAR_WEBHOOK_TOKEN] },
+  async (request) => {
+    if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required");
+    const caller = await db.collection("clients").doc(request.auth.uid).get();
+    if (!caller.exists || caller.data().isAdmin !== true) {
+      throw new HttpsError("permission-denied", "Admin only");
+    }
+
+    const url = `https://us-central1-${process.env.GCLOUD_PROJECT}.cloudfunctions.net/calendarWebhook`;
+    return calendarSyncV2.registerCalendarWatch(
+      CALENDAR_ID, url, CALENDAR_WEBHOOK_TOKEN.value()
+    );
+  }
+);
+
+/** One-shot admin trigger: run the sync by hand (initial full sync, recovery). */
+exports.runCalendarSyncNow = onCall(async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in required");
+  const caller = await db.collection("clients").doc(request.auth.uid).get();
+  if (!caller.exists || caller.data().isAdmin !== true) {
+    throw new HttpsError("permission-denied", "Admin only");
+  }
+  return calendarSyncV2.runIncrementalSync(CALENDAR_ID);
 });
