@@ -1460,6 +1460,12 @@ exports.manageUsers = onCall(async (request) => {
         is_admin_updated: isAdmin,
         from_calendar_appointment: true,
         from_google_calendar: false,
+        // Clearing from_google_calendar already declares "this is a real
+        // booking now". is_regular says the same thing and is what the home and
+        // Prossimi streams actually filter on, but only createSingleAppointment
+        // ever set it -- so a converted Google event stayed is_regular:false
+        // forever and never appeared in upcoming, despite converting correctly.
+        is_regular: true,
       };
 
       // Only update fields that were provided
