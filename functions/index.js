@@ -4212,3 +4212,83 @@ exports.runCalendarSyncNow = onCall(async (request) => {
   }
   return calendarSyncV2.runIncrementalSync(CALENDAR_ID);
 });
+
+/* =========================================================
+   ⏰ DURABILITY: keep the watch alive, and a floor under it
+   ========================================================= */
+
+/**
+ * Renew the Google Calendar watch channel before it expires.
+ *
+ * Google caps a calendar channel at 7 days (calendarSyncV2.js:328) and nothing
+ * renewed it, so real-time sync would have died silently on expiry — the only
+ * symptom being "the agenda stopped updating".
+ *
+ * DAILY, not weekly, and deliberately so: it keeps us ~7 days from expiry at
+ * all times, and no single failed run can lapse the channel — that would take
+ * six consecutive failures. A weekly job would have zero margin.
+ *
+ * Reuses calendarSyncV2.registerCalendarWatch — the SAME function the onCall
+ * admin trigger calls, so the two paths cannot drift. It stops the previous
+ * channel before opening the new one (calendarSyncV2.js:305-314), so repeated
+ * calls are re-entrant and do not stack channels.
+ *
+ * syncToken SAFETY: registerCalendarWatch writes only channelId,
+ * channelResourceId and channelExpiration (calendarSyncV2.js:338-342). The
+ * syncToken lives in the same sync_state doc and is never touched here, so
+ * renewal replaces the notification channel WITHOUT resetting the incremental
+ * cursor. Losing it would force a full resync on the next poke.
+ */
+exports.renewCalendarWatch = onSchedule(
+  {
+    schedule: "30 3 * * *",
+    timeZone: "Europe/Rome",
+    secrets: [CALENDAR_WEBHOOK_TOKEN],
+  },
+  async () => {
+    const url = `https://us-central1-${process.env.GCLOUD_PROJECT}.cloudfunctions.net/calendarWebhook`;
+    try {
+      const res = await calendarSyncV2.registerCalendarWatch(
+        CALENDAR_ID, url, CALENDAR_WEBHOOK_TOKEN.value()
+      );
+      logger.info(`[syncV2] watch renewed: ${res.channelId} exp=${res.expiration}`);
+      return res;
+    } catch (err) {
+      // Throw, don't swallow: a silently failing renewal is exactly the failure
+      // mode this job exists to prevent. Scheduler marks the run failed and
+      // retries, and tomorrow's run still has ~6 days of margin.
+      logger.error(`[syncV2] watch renewal FAILED: ${err.message}`);
+      throw err;
+    }
+  }
+);
+
+/**
+ * Nightly catch-up poll — the floor under the webhook.
+ *
+ * The webhook is the primary path and stays so. This exists only so that a
+ * lapsed channel, a missed poke or a dropped notification degrades to "up to
+ * 24h stale" instead of "silently dead".
+ *
+ * Reuses calendarSyncV2.runIncrementalSync — the SAME entry point the webhook
+ * calls, so it inherits the syncToken cursor, reconcile-by-event-id, the UTC
+ * conversion and SAFETY_CAP (200, enforced on toCreate BEFORE any write,
+ * calendarSyncV2.js:218-224). It is the webhook's handler minus the trigger.
+ *
+ * NO RE-NOTIFY: the token means an already-synced event returns nothing. Even
+ * after a 410 token reset forces a full list, unchanged events classify as
+ * toUpdate (never toCreate), so onAppointmentCreatedBackground does not fire;
+ * their only changed field is last_synced_at, which onAppointmentUpdatedBackground
+ * skips as a calendarSyncFields-only write. A catch-up cannot re-announce.
+ */
+exports.nightlySafetyPoll = onSchedule(
+  {
+    schedule: "0 4 * * *",
+    timeZone: "Europe/Rome",
+  },
+  async () => {
+    const result = await calendarSyncV2.runIncrementalSync(CALENDAR_ID);
+    logger.info(`[syncV2] nightly safety poll: ${JSON.stringify(result)}`);
+    return result;
+  }
+);
