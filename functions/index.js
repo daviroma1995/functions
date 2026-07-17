@@ -2218,63 +2218,145 @@ exports.sendNotification = onDocumentCreated("new_notification/{docId}", async (
 
 
 /**
- * 📅 Notify admins that a Google Calendar event landed as a provisional
- * appointment and needs its details filled in.
+ * Shallow field-level diff between two Firestore snapshots. Timestamps compare
+ * by millis and arrays by value; everything else by identity.
+ *
+ * Extracted from onAppointmentUpdatedBackground so the Google-origin branches
+ * can ask "what actually changed?" BEFORE the guards run, not only after.
+ */
+function computeChangedFields(before, after) {
+  const beforeKeys = Object.keys(before || {});
+  const afterKeys = Object.keys(after || {});
+
+  const addedKeys = afterKeys.filter((k) => !beforeKeys.includes(k));
+
+  const changedKeys = afterKeys.filter((k) => {
+    if (!beforeKeys.includes(k)) return false;
+    const beforeVal = before[k];
+    const afterVal = after[k];
+    if (beforeVal?.toMillis && afterVal?.toMillis) {
+      return beforeVal.toMillis() !== afterVal.toMillis();
+    }
+    if (Array.isArray(beforeVal) && Array.isArray(afterVal)) {
+      return JSON.stringify(beforeVal) !== JSON.stringify(afterVal);
+    }
+    return beforeVal !== afterVal;
+  });
+
+  return [...addedKeys, ...changedKeys];
+}
+
+/**
+ * One delivery: tokens → FCM → new_notification doc. The single proven send
+ * path (getAdminUsers → getFcmTokens → sendFcm → doc with fcmSent), factored
+ * out so every notification cell in the matrix goes through the same code.
+ *
+ * `navigable` decides whether the payload carries a route hint: a create or an
+ * edit can open the appointment detail; a delete has nothing left to open.
+ */
+async function deliverNotification(appointmentId, { receivers, title, body, type, navigable }) {
+  if (!receivers || receivers.length === 0) return;
+
+  const notificationRef = db.collection("new_notification").doc();
+
+  const tokens = await getFcmTokens(receivers);
+  logger.info(`🔑 [Notify] ${tokens.length} FCM tokens for ${receivers.length} receivers (${type})`);
+
+  let fcmSuccessCount = 0;
+  let fcmFailureCount = 0;
+
+  if (tokens.length > 0) {
+    const data = {
+      type,
+      appointmentId: appointmentId,
+      notificationId: notificationRef.id,
+    };
+    // Tap-to-detail: the app reads `route` to decide whether to navigate.
+    if (navigable) data.route = "appointment_detail";
+
+    const fcmResult = await sendFcm(tokens, title, body, data, receivers);
+    fcmSuccessCount = fcmResult.successCount;
+    fcmFailureCount = fcmResult.failureCount;
+  }
+
+  const notifDoc = buildNotification({
+    id: notificationRef.id,
+    title,
+    body,
+    type,
+    receiverIds: receivers,
+    appointmentId: appointmentId,
+  });
+
+  await notificationRef.set({
+    ...notifDoc,
+    fcmSent: tokens.length > 0,
+    fcmSentAt: admin.firestore.Timestamp.now(),
+    fcmSuccessCount,
+    fcmFailureCount,
+  });
+
+  logger.info(`✅ [Notify] ${type} → ${receivers.length} users: "${title}"`);
+}
+
+/**
+ * 📅 Notify admins about a Google-Calendar-origin appointment event.
  *
  * Google-origin docs have no client_id and no created_by, so the normal
  * getNotificationRecipients() path does not apply — admins are the only
  * correct recipients. Never sends to clients.
  */
-async function notifyAdminsOfCalendarAppointment(appointmentId) {
+async function notifyAdminsOfCalendarEvent(appointmentId, { title, body, type, navigable }) {
   try {
     const receivers = await getAdminUsers();
     if (receivers.length === 0) {
       logger.warn(`⚠️ [Calendar] No admin users to notify for ${appointmentId}`);
       return;
     }
-
-    const title = "Nuovo evento dal calendario";
-    const body = "Da completare — apri l'app per inserire i dettagli.";
-
-    const notificationRef = db.collection("new_notification").doc();
-
-    const tokens = await getFcmTokens(receivers);
-    logger.info(`🔑 [Calendar] Found ${tokens.length} FCM tokens for ${receivers.length} admins`);
-
-    let fcmSuccessCount = 0;
-    let fcmFailureCount = 0;
-
-    if (tokens.length > 0) {
-      const fcmResult = await sendFcm(tokens, title, body, {
-        type: "appointment_calendar_new",
-        appointmentId: appointmentId,
-        notificationId: notificationRef.id,
-      }, receivers);
-      fcmSuccessCount = fcmResult.successCount;
-      fcmFailureCount = fcmResult.failureCount;
-      logger.info(`✅ [Calendar] FCM sent: ${fcmSuccessCount} success, ${fcmFailureCount} failed`);
-    }
-
-    const notifDoc = buildNotification({
-      id: notificationRef.id,
-      title,
-      body,
-      type: "appointment_calendar_new",
-      receiverIds: receivers,
-      appointmentId: appointmentId,
-    });
-
-    await notificationRef.set({
-      ...notifDoc,
-      fcmSent: tokens.length > 0,
-      fcmSentAt: admin.firestore.Timestamp.now(),
-      fcmSuccessCount,
-      fcmFailureCount,
-    });
-
-    logger.info(`✅ [Calendar] Admin notification created for ${appointmentId} → ${receivers.length} admins`);
+    await deliverNotification(appointmentId, { receivers, title, body, type, navigable });
   } catch (error) {
     logger.error(`❌ [Calendar] Admin notification failed for ${appointmentId}:`, error.message);
+  }
+}
+
+/**
+ * 👤 Notify about an app/admin-origin create/edit/delete.
+ *
+ * The audience is split deliberately. Other admins hear WHO did it
+ * ("Maria ha modificato un appuntamento"); the client keeps the salon-voice
+ * copy ("Abbiamo modificato un appuntamento"). A single shared title would
+ * either leak a staff member's name to the customer or hide it from staff.
+ *
+ * The actor is always excluded — they just performed the action.
+ */
+async function notifyAppOriginChange(appointmentId, { actorId, actorName, isAdmin, clientId, verb, type, navigable }) {
+  try {
+    const adminIds = await getAdminUsers();
+    const adminReceivers = adminIds.filter((id) => id !== actorId);
+
+    await deliverNotification(appointmentId, {
+      receivers: adminReceivers,
+      title: `${actorName} ha ${verb} un appuntamento`,
+      body: "Controlla i dettagli nell'app.",
+      type,
+      navigable,
+    });
+
+    // The client only hears about it when an ADMIN acted on their behalf. When
+    // the client acted themselves they already know, and the old CASE 1 path
+    // never included them either.
+    const trimmedClientId = (clientId || "").trim();
+    if (isAdmin && trimmedClientId && trimmedClientId !== actorId) {
+      await deliverNotification(appointmentId, {
+        receivers: [trimmedClientId],
+        title: `Abbiamo ${verb} un appuntamento`,
+        body: "Controlla i dettagli nell'app.",
+        type,
+        navigable,
+      });
+    }
+  } catch (error) {
+    logger.error(`❌ [Background] Notification failed for ${appointmentId}:`, error.message);
   }
 }
 
@@ -2293,7 +2375,12 @@ async function notifyAdminsOfCalendarAppointment(appointmentId) {
     // admin-targeted TASK 3 so the provisional doc doesn't land silently.
     if (appointment.from_google_calendar === true) {
       logger.info(`📅 [Background] Google Calendar appointment ${appointmentId} — admin notify only`);
-      await notifyAdminsOfCalendarAppointment(appointmentId);
+      await notifyAdminsOfCalendarEvent(appointmentId, {
+        title: "Nuovo appuntamento dal calendario",
+        body: "Da completare — apri l'app per inserire i dettagli.",
+        type: "appointment_calendar_new",
+        navigable: true,
+      });
       return;
     }
 
@@ -2324,66 +2411,15 @@ async function notifyAdminsOfCalendarAppointment(appointmentId) {
       // ==========================================================
       // TASK 3: SEND NOTIFICATIONS (DIRECT FCM - NO RACE CONDITION)
       // ==========================================================
-      try {
-        const isAdmin = appointment.is_admin_created || false;
-        const currentUserId = appointment.created_by || "system";
-        const currentUserName = appointment.created_by_name || "Sistema";
-        const clientId = appointment.client_id;
-  
-        const receivers = await getNotificationRecipients(isAdmin, currentUserId, clientId);
-  
-        if (receivers.length > 0) {
-          const title = isAdmin
-            ? "Abbiamo creato un appuntamento"
-            : `${currentUserName} ha creato un appuntamento`;
-          const body = "Controlla i dettagli nell'app.";
-  
-          // ✅ Generate notification ID first
-          const notificationRef = db.collection("new_notification").doc();
-  
-          // ✅ Get tokens FIRST
-          const tokens = await getFcmTokens(receivers);
-          logger.info(`🔑 [Background] Found ${tokens.length} FCM tokens for ${receivers.length} receivers`);
-  
-          // ✅ Track FCM results
-          let fcmSuccessCount = 0;
-          let fcmFailureCount = 0;
-  
-          // ✅ Send FCM BEFORE creating document
-          if (tokens.length > 0) {
-            const fcmResult = await sendFcm(tokens, title, body, {
-              type: "appointment_new",
-              appointmentId: appointmentId,
-              notificationId: notificationRef.id,
-            }, receivers);
-            fcmSuccessCount = fcmResult.successCount;
-            fcmFailureCount = fcmResult.failureCount;
-            logger.info(`✅ [Background] FCM sent: ${fcmSuccessCount} success, ${fcmFailureCount} failed`);
-          }
-  
-          // ✅ Create notification with fcmSent ALREADY SET (prevents race condition)
-          const notifDoc = buildNotification({
-            id: notificationRef.id,
-            title,
-            body,
-            type: "appointment_new",
-            receiverIds: receivers,
-            appointmentId: appointmentId,
-          });
-  
-          await notificationRef.set({
-            ...notifDoc,
-            fcmSent: tokens.length > 0,
-            fcmSentAt: admin.firestore.Timestamp.now(),
-            fcmSuccessCount,
-            fcmFailureCount,
-          });
-  
-          logger.info(`✅ [Background] Notification created for ${appointmentId} → ${receivers.length} users`);
-        }
-      } catch (error) {
-        logger.error(`❌ [Background] Notification failed for ${appointmentId}:`, error.message);
-      }
+      await notifyAppOriginChange(appointmentId, {
+        actorId: appointment.created_by || "system",
+        actorName: appointment.created_by_name || "Sistema",
+        isAdmin: appointment.is_admin_created || false,
+        clientId: appointment.client_id,
+        verb: "creato",
+        type: "appointment_new",
+        navigable: true,
+      });
   
       logger.info(`✅ [Background] All tasks completed for ${appointmentId}`);
   
@@ -2405,8 +2441,58 @@ exports.onAppointmentUpdatedBackground = onDocumentUpdated("appointments/{appoin
   // ⚡ SKIP CONDITIONS (Prevent False Notifications)
   // ========================================
   
-  // ✅ SKIP if from Google Calendar (to avoid sync loops)
+  // The field diff is needed by the Google-origin branches below, so it is
+  // computed up front rather than after the guards.
+  const calendarSyncFields = ['google_calendar_event_id', 'last_calendar_sync', 'last_synced_at'];
+  const allChanges = computeChangedFields(before, after);
+
+  // ✅ GOOGLE EVENT DELETED (archive)
+  // syncV2 archives a deleted Google event by flipping from_google_calendar
+  // true→false and setting google_event_deleted (calendarSyncV2.js:266-271).
+  // That flip defeats the from_google_calendar guard below — which is why a
+  // DELETE used to fire the "ha modificato" UPDATE copy at every admin. It is
+  // detected here, ahead of that guard, and routed as a delete.
+  if (after.google_event_deleted === true && before.google_event_deleted !== true) {
+    const archivedClientId = (after.client_id || "").trim();
+
+    // Hybrid: a provisional row nobody ever converted affects no one — stay
+    // silent. A real booking disappearing is something staff must hear about.
+    if (!archivedClientId) {
+      logger.info(`⏭️ [Background] Google archive ${appointmentId} — provisional (no client), silent`);
+      return;
+    }
+
+    logger.info(`🗑️ [Background] Google archive ${appointmentId} — real booking, notifying admins`);
+    await notifyAdminsOfCalendarEvent(appointmentId, {
+      title: "Appuntamento del calendario eliminato",
+      body: "Controlla i dettagli nell'app.",
+      type: "appointment_calendar_deleted",
+      navigable: false, // nothing left to open
+    });
+    return;
+  }
+
+  // ✅ GOOGLE-ORIGIN UPDATE
+  // Points and write-back stay skipped (a write-back here would loop the
+  // sync), but a genuine Google-side edit should reach admins. `last_synced_at`
+  // is written by every syncV2 update and by nothing else, so it identifies a
+  // sync-driven write; anything else on a Google doc keeps the original
+  // skip-everything behaviour.
   if (after.from_google_calendar === true) {
+    const isSyncWrite = allChanges.includes('last_synced_at');
+    const onlySyncFields = allChanges.every((k) => calendarSyncFields.includes(k));
+
+    if (isSyncWrite && allChanges.length > 0 && !onlySyncFields) {
+      logger.info(`✏️ [Background] Google edit ${appointmentId} — changed: [${allChanges.join(', ')}]`);
+      await notifyAdminsOfCalendarEvent(appointmentId, {
+        title: "Appuntamento del calendario modificato",
+        body: "Controlla i dettagli nell'app.",
+        type: "appointment_calendar_updated",
+        navigable: true,
+      });
+      return;
+    }
+
     logger.info(`⏭️ [Background] Skipping Google Calendar appointment update ${appointmentId}`);
     return;
   }
@@ -2440,33 +2526,6 @@ exports.onAppointmentUpdatedBackground = onDocumentUpdated("appointments/{appoin
   }
 
   // ✅ SKIP if this is a Calendar sync update (only calendar-related fields changed)
-  const calendarSyncFields = ['google_calendar_event_id', 'last_calendar_sync', 'last_synced_at'];
-  
-  const beforeKeys = Object.keys(before || {});
-  const afterKeys = Object.keys(after || {});
-  
-  // Find added fields
-  const addedKeys = afterKeys.filter(k => !beforeKeys.includes(k));
-  
-  // Find changed fields (excluding added)
-  const changedKeys = afterKeys.filter(k => {
-    if (!beforeKeys.includes(k)) return false;
-    const beforeVal = before[k];
-    const afterVal = after[k];
-    // Compare Timestamps by millis
-    if (beforeVal?.toMillis && afterVal?.toMillis) {
-      return beforeVal.toMillis() !== afterVal.toMillis();
-    }
-    // Compare arrays
-    if (Array.isArray(beforeVal) && Array.isArray(afterVal)) {
-      return JSON.stringify(beforeVal) !== JSON.stringify(afterVal);
-    }
-    // Compare primitives
-    return beforeVal !== afterVal;
-  });
-  
-  const allChanges = [...addedKeys, ...changedKeys];
-  
   // If only calendar sync fields changed, skip notification
   if (allChanges.length > 0 && allChanges.every(k => calendarSyncFields.includes(k))) {
     logger.info(`⏭️ [Background] Skipping - only calendar sync fields changed: [${allChanges.join(', ')}]`);
@@ -2530,61 +2589,15 @@ exports.onAppointmentUpdatedBackground = onDocumentUpdated("appointments/{appoin
       logger.info(`   currentUserName: ${currentUserName}`);
       logger.info(`   clientId: ${clientId}`);
 
-      const receivers = await getNotificationRecipients(isAdmin, currentUserId, clientId);
-      
-      logger.info(`📋 [Background] Receivers: [${receivers.join(', ')}]`);
-
-      if (receivers.length > 0) {
-        const title = isAdmin
-          ? "Abbiamo modificato un appuntamento"
-          : `${currentUserName} ha modificato un appuntamento`;
-        const body = "Controlla i dettagli nell'app.";
-
-        // ✅ Generate notification ID first
-        const notificationRef = db.collection("new_notification").doc();
-
-        // ✅ Get tokens FIRST
-        const tokens = await getFcmTokens(receivers);
-        logger.info(`🔑 [Background] Found ${tokens.length} FCM tokens for ${receivers.length} receivers`);
-
-        // ✅ Track FCM results
-        let fcmSuccessCount = 0;
-        let fcmFailureCount = 0;
-
-        // ✅ Send FCM BEFORE creating document
-        if (tokens.length > 0) {
-          const fcmResult = await sendFcm(tokens, title, body, {
-            type: "appointment_update",
-            appointmentId: appointmentId,
-            notificationId: notificationRef.id,
-          }, receivers);
-          fcmSuccessCount = fcmResult.successCount;
-          fcmFailureCount = fcmResult.failureCount;
-          logger.info(`✅ [Background] FCM sent: ${fcmSuccessCount} success, ${fcmFailureCount} failed`);
-        }
-
-        // ✅ Create notification with fcmSent ALREADY SET
-        const notifDoc = buildNotification({
-          id: notificationRef.id,
-          title,
-          body,
-          type: "appointment_update",
-          receiverIds: receivers,
-          appointmentId: appointmentId,
-        });
-
-        await notificationRef.set({
-          ...notifDoc,
-          fcmSent: tokens.length > 0,
-          fcmSentAt: admin.firestore.Timestamp.now(),
-          fcmSuccessCount,
-          fcmFailureCount,
-        });
-
-        logger.info(`✅ [Background] Notification created for ${appointmentId} → ${receivers.length} users`);
-      } else {
-        logger.info(`⏭️ [Background] No receivers for notification`);
-      }
+      await notifyAppOriginChange(appointmentId, {
+        actorId: currentUserId,
+        actorName: currentUserName,
+        isAdmin,
+        clientId,
+        verb: "modificato",
+        type: "appointment_update",
+        navigable: true,
+      });
     } catch (error) {
       logger.error(`❌ [Background] Notification failed for ${appointmentId}:`, error.message);
     }
@@ -2656,66 +2669,15 @@ exports.onAppointmentUpdatedBackground = onDocumentUpdated("appointments/{appoin
       // ==========================================================
       // TASK 3: SEND NOTIFICATIONS (DIRECT FCM - NO RACE CONDITION)
       // ==========================================================
-      try {
-        const isAdmin = appointmentData._isAdminDeleted || false;
-        const currentUserId = appointmentData._deletedBy || "system";
-        const currentUserName = appointmentData._deletedByName || "Sistema";
-        const clientId = appointmentData.client_id;
-  
-        const receivers = await getNotificationRecipients(isAdmin, currentUserId, clientId);
-  
-        if (receivers.length > 0) {
-          const title = isAdmin
-            ? "Abbiamo eliminato un appuntamento"
-            : `${currentUserName} ha eliminato un appuntamento`;
-          const body = "Controlla i dettagli nell'app.";
-  
-          // ✅ Generate notification ID first
-          const notificationRef = db.collection("new_notification").doc();
-  
-          // ✅ Get tokens FIRST
-          const tokens = await getFcmTokens(receivers);
-          logger.info(`🔑 [Background] Found ${tokens.length} FCM tokens for ${receivers.length} receivers`);
-  
-          // ✅ Track FCM results
-          let fcmSuccessCount = 0;
-          let fcmFailureCount = 0;
-  
-          // ✅ Send FCM BEFORE creating document
-          if (tokens.length > 0) {
-            const fcmResult = await sendFcm(tokens, title, body, {
-              type: "appointment_delete",
-              appointmentId: appointmentId,
-              notificationId: notificationRef.id,
-            }, receivers);
-            fcmSuccessCount = fcmResult.successCount;
-            fcmFailureCount = fcmResult.failureCount;
-            logger.info(`✅ [Background] FCM sent: ${fcmSuccessCount} success, ${fcmFailureCount} failed`);
-          }
-  
-          // ✅ Create notification with fcmSent ALREADY SET
-          const notifDoc = buildNotification({
-            id: notificationRef.id,
-            title,
-            body,
-            type: "appointment_delete",
-            receiverIds: receivers,
-            appointmentId: appointmentId,
-          });
-  
-          await notificationRef.set({
-            ...notifDoc,
-            fcmSent: tokens.length > 0,
-            fcmSentAt: admin.firestore.Timestamp.now(),
-            fcmSuccessCount,
-            fcmFailureCount,
-          });
-  
-          logger.info(`✅ [Background] Deletion notification created for ${appointmentId} → ${receivers.length} users`);
-        }
-      } catch (error) {
-        logger.error(`❌ [Background] Notification failed for ${appointmentId}:`, error.message);
-      }
+      await notifyAppOriginChange(appointmentId, {
+        actorId: appointmentData._deletedBy || "system",
+        actorName: appointmentData._deletedByName || "Sistema",
+        isAdmin: appointmentData._isAdminDeleted || false,
+        clientId: appointmentData.client_id,
+        verb: "eliminato",
+        type: "appointment_delete",
+        navigable: false, // the appointment is gone — nothing to open
+      });
   
       logger.info(`✅ [Background] All deletion tasks completed for ${appointmentId}`);
   
