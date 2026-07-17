@@ -2204,6 +2204,67 @@ exports.sendNotification = onDocumentCreated("new_notification/{docId}", async (
 });
 
 
+/**
+ * 📅 Notify admins that a Google Calendar event landed as a provisional
+ * appointment and needs its details filled in.
+ *
+ * Google-origin docs have no client_id and no created_by, so the normal
+ * getNotificationRecipients() path does not apply — admins are the only
+ * correct recipients. Never sends to clients.
+ */
+async function notifyAdminsOfCalendarAppointment(appointmentId) {
+  try {
+    const receivers = await getAdminUsers();
+    if (receivers.length === 0) {
+      logger.warn(`⚠️ [Calendar] No admin users to notify for ${appointmentId}`);
+      return;
+    }
+
+    const title = "Nuovo evento dal calendario";
+    const body = "Da completare — apri l'app per inserire i dettagli.";
+
+    const notificationRef = db.collection("new_notification").doc();
+
+    const tokens = await getFcmTokens(receivers);
+    logger.info(`🔑 [Calendar] Found ${tokens.length} FCM tokens for ${receivers.length} admins`);
+
+    let fcmSuccessCount = 0;
+    let fcmFailureCount = 0;
+
+    if (tokens.length > 0) {
+      const fcmResult = await sendFcm(tokens, title, body, {
+        type: "appointment_calendar_new",
+        appointmentId: appointmentId,
+        notificationId: notificationRef.id,
+      }, receivers);
+      fcmSuccessCount = fcmResult.successCount;
+      fcmFailureCount = fcmResult.failureCount;
+      logger.info(`✅ [Calendar] FCM sent: ${fcmSuccessCount} success, ${fcmFailureCount} failed`);
+    }
+
+    const notifDoc = buildNotification({
+      id: notificationRef.id,
+      title,
+      body,
+      type: "appointment_calendar_new",
+      receiverIds: receivers,
+      appointmentId: appointmentId,
+    });
+
+    await notificationRef.set({
+      ...notifDoc,
+      fcmSent: tokens.length > 0,
+      fcmSentAt: admin.firestore.Timestamp.now(),
+      fcmSuccessCount,
+      fcmFailureCount,
+    });
+
+    logger.info(`✅ [Calendar] Admin notification created for ${appointmentId} → ${receivers.length} admins`);
+  } catch (error) {
+    logger.error(`❌ [Calendar] Admin notification failed for ${appointmentId}:`, error.message);
+  }
+}
+
 /* =========================================================
    🔄 BACKGROUND: Process New Appointments
    This runs automatically when an appointment is created
@@ -2214,9 +2275,12 @@ exports.sendNotification = onDocumentCreated("new_notification/{docId}", async (
   
     logger.info(`🔄 [Background] Processing appointment ${appointmentId}`);
   
-    // Skip if this appointment was synced from Google Calendar
+    // Google Calendar-origin appointment: skip TASK 1 (no client → no points)
+    // and TASK 2 (writing back to Google would loop the sync), but still run an
+    // admin-targeted TASK 3 so the provisional doc doesn't land silently.
     if (appointment.from_google_calendar === true) {
-      logger.info(`⏭️ [Background] Skipping Google Calendar appointment ${appointmentId}`);
+      logger.info(`📅 [Background] Google Calendar appointment ${appointmentId} — admin notify only`);
+      await notifyAdminsOfCalendarAppointment(appointmentId);
       return;
     }
 
